@@ -1,16 +1,19 @@
 # EnvCheck Benchmark
 
-A small benchmark for evaluating EnvPilot's ability to handle Python environments where a target library has a known breaking change — i.e. `canonical_solution` works in one library version and crashes in another due to API removal/rename, and EnvPilot must generate code that runs in the broken environment.
+A small benchmark for evaluating EnvPilot on Python environments where a target library has a known breaking change. Each case has a single `bad_env` (the problem environment), a `canonical_solution` that crashes in `bad_env` due to API removal/rename, and a hand-checked `correct_solution` that does the same task using an alternative API and passes the same test in `bad_env`.
+
+EnvPilot's job: given the task description and `bad_env`, generate code that passes `test` in `bad_env`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `build_candidates.py` | Builds `candidates.json` from BigCodeBench v0.1.4 + `manual_cases.py`. Re-runnable. |
-| `manual_cases.py` | 8 hand-written cases in BigCodeBench dict format covering numpy 2.0 / pandas 2.0 / Pillow 10 / flask 2.3 removals. |
-| `runner_utils.py` | Shared utilities: build cached `uv` venvs from a pip-spec list, compose code+test scripts, run with timeout. |
-| `verify_ground_truth.py` | Verifies each candidate: runs `canonical_solution + test` in both `bad_env` and `good_env`, expects bad to fail with documented `error_type` and good to pass. |
-| `candidates.json` | **The benchmark itself.** 21 verified `(task, bad_env, good_env)` cases with full BCB-style fields. Generated but committed for convenience. |
+| `build_candidates.py` | Builds `candidates.json` from BigCodeBench v0.1.4 + `manual_cases.py` + `bcb_corrections.py`. Re-runnable. |
+| `manual_cases.py` | 8 hand-written cases in BigCodeBench dict format (numpy 2.0 / pandas 2.0 / Pillow 10 / flask 2.3 removals). Each has its own `correct_solution`. |
+| `bcb_corrections.py` | `task_id → (old_substr, new_substr)` mapping that derives `correct_solution` from each BCB canonical via a single string replacement. |
+| `runner_utils.py` | Shared utilities: build cached `uv` venvs (Python version aware), compose code+test scripts, run with `MPLBACKEND=Agg` + timeout. |
+| `verify_ground_truth.py` | Verifies each candidate in its `bad_env`: runs `canonical+test` (expects FAIL with `error_type`), runs `correct+test` (expects PASS). Both must hold for `verified=True`. |
+| `candidates.json` | **The benchmark itself.** 19 verified cases with full fields. Generated but committed for convenience. |
 | `bigcodebench_pool.json` | Early 50-task random sample from BCB filtered to target libs. Kept for reference; not used by current build pipeline. |
 | `pool_stats.json` | Library distribution of the original BCB filtered pool. Kept for reference. |
 | `verification_report.json` | (gitignored) Output of last `verify_ground_truth.py` run. |
@@ -19,10 +22,11 @@ A small benchmark for evaluating EnvPilot's ability to handle Python environment
 ## Usage
 
 ```bash
-# 1. Re-generate candidates.json from sources (BCB + manual_cases.py)
+# 1. Re-generate candidates.json from sources (BCB + manual_cases.py + bcb_corrections.py)
 uv run --with datasets python benchmark/build_candidates.py
 
-# 2. Verify ground truth: build bad_env + good_env per case, run canonical+test
+# 2. Verify ground truth: build bad_env per case, run canonical (expect FAIL)
+#    and correct_solution (expect PASS) in the same env
 python benchmark/verify_ground_truth.py             # all cases
 python benchmark/verify_ground_truth.py --case manual_006   # one case
 python benchmark/verify_ground_truth.py --first 5           # first 5
@@ -32,7 +36,7 @@ python benchmark/verify_ground_truth.py --update            # write `verified` f
 python benchmark/verify_ground_truth.py --rebuild
 ```
 
-The first `verify_ground_truth.py` run takes 5–10 minutes (creates ~10 unique venvs across cases). Subsequent runs are seconds (envs are cached by `(python_version, sorted(pip_spec))` hash, so cases sharing identical envs share one venv).
+The first `verify_ground_truth.py` run takes 5–10 minutes (creates ~10 unique venvs across cases). Subsequent runs are seconds (envs are cached by `(python_version, sorted(pip_spec))` hash, so cases sharing identical envs share one venv). `runner_utils.py` sets `MPLBACKEND=Agg` for all subprocess runs to avoid Tk-backend imports failing on the python-build-standalone Python 3.8 build.
 
 ## Case schema (`candidates.json`)
 
@@ -46,10 +50,8 @@ Each entry is a dict:
   "library_under_test": "seaborn",
   "bad_version": "0.10.1",
   "good_version": "0.13.2",
-  "bad_env_pip":  ["matplotlib==3.2.2", "numpy==1.18.5", "pandas==1.0.5", "regex", "seaborn==0.10.1"],
-  "good_env_pip": ["matplotlib==3.8.4", "numpy==1.26.4", "pandas==2.2.2", "regex", "seaborn==0.13.2"],
-  "bad_python":  "3.8",
-  "good_python": "3.11",
+  "bad_env_pip": ["matplotlib==3.2.2", "numpy==1.18.5", "pandas==1.0.5", "regex", "seaborn==0.10.1"],
+  "bad_python": "3.8",
   "error_type": "AttributeError",
   "kind": "introduction",
   "rule_label": "sns_histplot",
@@ -58,7 +60,8 @@ Each entry is a dict:
   "note": "",
   "instruct_prompt": "...",
   "code_prompt": "...",
-  "canonical_solution": "...",
+  "canonical_solution": "...sns.histplot(data=df, x=\"Age\")...",
+  "correct_solution":   "...sns.distplot(df[\"Age\"], kde=False)...",
   "test": "...",
   "entry_point": "task_func",
   "verified": true
@@ -66,17 +69,20 @@ Each entry is a dict:
 ```
 
 - `kind` — `"introduction"` (canonical uses an API that didn't exist in `bad_version`) or `"removal"` (canonical uses an API that was removed in `bad_version`).
-- `bad_env_pip` / `good_env_pip` — full pip-installable lists. Peer libs are pinned to mutually-compatible snapshot versions to avoid (a) a second confounding break and (b) ABI mismatches (e.g. pandas wheel ↔ numpy version).
-- `bad_python` / `good_python` — venv Python version. Some intro cases (sns.histplot, sns.displot) need Python 3.8 because their old peers (matplotlib 3.2.2, numpy 1.18.5) lack 3.10+ wheels; everything else uses 3.11.
-- `verified` — true if `verify_ground_truth.py` confirmed canonical+test crashes in bad_env and passes in good_env, with the documented `error_type` appearing in stderr.
+- `bad_env_pip` — full pip-installable list. Peer libs are pinned to mutually-compatible snapshot versions to avoid (a) a second confounding break and (b) ABI mismatches (e.g. pandas wheel ↔ numpy version). Transitive ABI deps (numpy ↔ pandas, etc.) are auto-included.
+- `bad_python` — venv Python version. Some intro cases (sns.histplot, sns.displot) need Python 3.8 because their old peers (matplotlib 3.2.2, numpy 1.18.5) lack 3.10+ wheels; everything else uses 3.11.
+- `canonical_solution` — uses an API that crashes in `bad_env`.
+- `correct_solution` — uses an alternative API that yields the same behavior **in the same `bad_env`**, so `correct + test` passes.
+- `good_version` — documentation only (no `good_env` is built or run): the lib version where `canonical` works.
+- `verified` — `True` only if both: (1) `canonical + test` crashes in `bad_env` with `error_type` in stderr, and (2) `correct + test` passes in `bad_env`. Property (2) is what proves the case is *solvable* — it surfaces unsolvable cases (test depends on `bad_env`-incompatible behavior of an alternative API) automatically.
 
 ## Distribution
 
-21 cases:
-- **Libraries**: seaborn (12) · numpy (3) · pandas (3) · scikit-learn (1) · Pillow (1) · flask (1)
-- **Direction**: introduction (12) · removal (9)
-- **Error types**: AttributeError (18) · TypeError (2) · ImportError (1)
-- **Source**: BCB directed regex search (13) · hand-written (8)
+24 cases (all `verified=true`):
+- **Libraries**: seaborn (10) · numpy (4) · pandas (4) · scikit-learn (2) · Pillow (1) · matplotlib (1) · scipy (1) · flask (1) — 8 libs
+- **Direction**: introduction (10) · removal (14)
+- **Error types**: AttributeError (17) · TypeError (4) · ImportError (3)
+- **Source**: BCB directed regex search (11) · hand-written (13)
 
 ## Data sources & attribution
 

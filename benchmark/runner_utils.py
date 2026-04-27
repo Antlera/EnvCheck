@@ -144,6 +144,7 @@ def compose_test_script(case: dict, user_code: Optional[str] = None) -> str:
 
 def run_in_env(env_dir: Path, script: str, timeout_s: int = 60) -> RunResult:
     """Write script to a tempfile, run with venv's python, capture output."""
+    import os
     import time
     with tempfile.NamedTemporaryFile(
         suffix=".py", mode="w", delete=False, dir="/tmp"
@@ -152,12 +153,17 @@ def run_in_env(env_dir: Path, script: str, timeout_s: int = 60) -> RunResult:
         script_path = f.name
 
     py = str(venv_python(env_dir))
+    # Force non-interactive matplotlib backend; the python-build-standalone
+    # Python 3.8 build we use for legacy envs has a broken _tkinter, so the
+    # default TkAgg backend can't import. Agg is safe for plt.show()/savefig.
+    env = {**os.environ, "MPLBACKEND": "Agg"}
     start = time.time()
     try:
         proc = subprocess.run(
             [py, script_path],
             capture_output=True, text=True,
             timeout=timeout_s,
+            env=env,
         )
         return RunResult(
             exit_code=proc.returncode,

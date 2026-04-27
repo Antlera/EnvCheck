@@ -18,6 +18,7 @@ from pathlib import Path
 
 from datasets import load_dataset
 
+from bcb_corrections import apply_correction
 from manual_cases import CASES as MANUAL_CASES
 
 OUT_PATH = Path(__file__).parent / "candidates.json"
@@ -28,6 +29,8 @@ OUT_PATH = Path(__file__).parent / "candidates.json"
 DROP_TASK_IDS = {
     "BigCodeBench/758",  # np_default_rng: test_case_6 assert_frame_equal vs hardcoded default_rng output
     "BigCodeBench/66",   # sns_distplot: seaborn 0.14 doesn't exist on PyPI; distplot still in 0.13.2 (deprecation only, no hard removal)
+    "BigCodeBench/196",  # sns_histplot: test asserts ax.containers[0].datavalues — histplot-specific attr, no distplot equivalent
+    "BigCodeBench/307",  # sns_histplot: test asserts str(type(plot))=='matplotlib.axes._axes.Axes' but old matplotlib 3.2.2 returns AxesSubplot
 }
 
 # Skip entire rules — usually because there's no Python version we can build them on.
@@ -245,18 +248,15 @@ def _make_env(snapshot: dict[str, str], task_libs: list[str],
     ]
 
 
-def _envs_for(rule_label: str, direction: str, task_libs: list[str],
-              lib_under_test: str, bad_version: str,
-              good_version: str) -> tuple[list[str], list[str], str, str]:
-    """Pick per-rule snapshots and Python versions, return
-    (bad_env_pip, good_env_pip, bad_python, good_python)."""
+def _bad_env_for(rule_label: str, direction: str, task_libs: list[str],
+                 lib_under_test: str, bad_version: str) -> tuple[list[str], str]:
+    """Pick per-rule bad-env snapshot + Python version, return (pip_lines, python)."""
     spec = RULE_ENV_SPEC.get((rule_label, direction))
     if spec is None:
         spec = DEFAULT_INTRO_SPEC if direction == "introduction" else DEFAULT_REMOVAL_SPEC
-    bad_snap, good_snap, bad_python, good_python = spec
+    bad_snap, _good_snap, bad_python, _good_python = spec
     bad_env = _make_env(bad_snap, task_libs, lib_under_test, bad_version)
-    good_env = _make_env(good_snap, task_libs, lib_under_test, good_version)
-    return bad_env, good_env, bad_python, good_python
+    return bad_env, bad_python
 
 
 def search_bigcodebench() -> list[dict]:
@@ -298,20 +298,24 @@ def search_bigcodebench() -> list[dict]:
             evidence = full[start:end].strip()[:200]
 
             effective_note = NEEDS_RUNTIME_VERIFY.get(t["task_id"], note)
-            bad_env_pip, good_env_pip, bad_python, good_python = _envs_for(
-                label, kind, libs, lib, bad, good
-            )
+            bad_env_pip, bad_python = _bad_env_for(label, kind, libs, lib, bad)
+
+            canonical = t.get("canonical_solution") or ""
+            try:
+                correct_solution = apply_correction(t["task_id"], canonical)
+            except (KeyError, ValueError) as e:
+                raise RuntimeError(
+                    f"Missing or invalid correction for {t['task_id']} ({label}): {e}"
+                )
 
             hits.append({
                 "task_id": t["task_id"],
                 "libs": libs,
                 "library_under_test": lib,
                 "bad_version": bad,
-                "good_version": good,
+                "good_version": good,  # documentation only — no good_env built
                 "bad_env_pip": bad_env_pip,
-                "good_env_pip": good_env_pip,
                 "bad_python": bad_python,
-                "good_python": good_python,
                 "error_type": err,
                 "kind": kind,
                 "rule_label": label,
@@ -320,7 +324,8 @@ def search_bigcodebench() -> list[dict]:
                 "note": effective_note,
                 "instruct_prompt": t.get("instruct_prompt") or "",
                 "code_prompt": t.get("code_prompt") or "",
-                "canonical_solution": t.get("canonical_solution") or "",
+                "canonical_solution": canonical,
+                "correct_solution": correct_solution,
                 "test": t.get("test") or "",
                 "entry_point": t.get("entry_point") or "task_func",
                 "verified": False,
@@ -341,14 +346,16 @@ def main() -> None:
     # 2) Manual cases (already have case_id like manual_001) — compute envs too
     for c in MANUAL_CASES:
         c = dict(c)
-        bad_env_pip, good_env_pip, bad_python, good_python = _envs_for(
+        bad_env_pip, bad_python = _bad_env_for(
             c["rule_label"], c["kind"], c["libs"], c["library_under_test"],
-            c["bad_version"], c["good_version"],
+            c["bad_version"],
         )
         c["bad_env_pip"] = bad_env_pip
-        c["good_env_pip"] = good_env_pip
         c["bad_python"] = bad_python
-        c["good_python"] = good_python
+        if "correct_solution" not in c:
+            raise RuntimeError(
+                f"Manual case {c['case_id']} is missing 'correct_solution' field"
+            )
         candidates.append(c)
 
     OUT_PATH.write_text(json.dumps(candidates, indent=2))

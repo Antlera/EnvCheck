@@ -39,6 +39,7 @@ _add(
     ),
     code_prompt="import numpy as np\n\ndef task_func(arr):\n",
     canonical_solution="    return float(np.product(arr))\n",
+    correct_solution="    return float(np.prod(arr))\n",
     test='''import unittest
 
 class TestCases(unittest.TestCase):
@@ -72,6 +73,9 @@ _add(
     code_prompt="import numpy as np\n\ndef task_func(values):\n",
     canonical_solution=(
         "    return np.array([np.NaN if v is None else v for v in values], dtype=float)\n"
+    ),
+    correct_solution=(
+        "    return np.array([np.nan if v is None else v for v in values], dtype=float)\n"
     ),
     test='''import unittest
 import numpy as np
@@ -110,6 +114,9 @@ _add(
     code_prompt="import numpy as np\n\ndef task_func(values, threshold):\n",
     canonical_solution=(
         "    return bool(np.alltrue(np.asarray(values) > threshold))\n"
+    ),
+    correct_solution=(
+        "    return bool(np.all(np.asarray(values) > threshold))\n"
     ),
     test='''import unittest
 
@@ -150,6 +157,12 @@ _add(
         "    df = pd.DataFrame()\n"
         "    for record in records:\n"
         "        df = df.append(record, ignore_index=True)\n"
+        "    return df\n"
+    ),
+    correct_solution=(
+        "    df = pd.DataFrame()\n"
+        "    for record in records:\n"
+        "        df = pd.concat([df, pd.DataFrame([record])], ignore_index=True)\n"
         "    return df\n"
     ),
     test='''import unittest
@@ -195,6 +208,12 @@ _add(
         "        result[col_name] = float(col_data.mean())\n"
         "    return result\n"
     ),
+    correct_solution=(
+        "    result = {}\n"
+        "    for col_name, col_data in df.items():\n"
+        "        result[col_name] = float(col_data.mean())\n"
+        "    return result\n"
+    ),
     test='''import unittest
 import pandas as pd
 
@@ -234,6 +253,11 @@ _add(
     canonical_solution=(
         "    return pd.read_csv(io.StringIO(csv_text), squeeze=True)\n"
     ),
+    correct_solution=(
+        # squeeze() with no axis collapses both dims, returning scalar for 1-row CSV.
+        # squeeze("columns") collapses only the column dim, always yielding a Series.
+        "    return pd.read_csv(io.StringIO(csv_text)).squeeze(\"columns\")\n"
+    ),
     test='''import unittest
 import pandas as pd
 
@@ -269,6 +293,9 @@ _add(
     code_prompt="from PIL import Image\n\ndef task_func(img, size):\n",
     canonical_solution=(
         "    return img.resize(size, Image.ANTIALIAS)\n"
+    ),
+    correct_solution=(
+        "    return img.resize(size, Image.LANCZOS)\n"
     ),
     test='''import unittest
 from PIL import Image
@@ -312,6 +339,10 @@ _add(
         "    from flask import Markup\n"
         "    return Markup(html)\n"
     ),
+    correct_solution=(
+        "    from markupsafe import Markup\n"
+        "    return Markup(html)\n"
+    ),
     test='''import unittest
 
 class TestCases(unittest.TestCase):
@@ -327,6 +358,239 @@ class TestCases(unittest.TestCase):
         result = task_func("<i>x</i>")
         # Markup objects are str subclasses
         self.assertIsInstance(result, str)
+''',
+)
+
+
+# ===== NumPy 1.24 type-alias removals =====
+
+_add(
+    case_id="manual_011",
+    task_id="Manual/011",
+    libs=["numpy"],
+    library_under_test="numpy",
+    bad_version="1.26.4", good_version="1.23.5",
+    error_type="AttributeError", kind="removal", rule_label="np_float_alias",
+    reason="np.float removed in NumPy 1.24; use built-in float or np.float64",
+    evidence_line="    return np.array(values, dtype=np.float)",
+    instruct_prompt=(
+        "Convert a list of numeric strings or numbers into a numpy float array. "
+        "Return the array."
+    ),
+    code_prompt="import numpy as np\n\ndef task_func(values):\n",
+    canonical_solution="    return np.array(values, dtype=np.float)\n",
+    correct_solution="    return np.array(values, dtype=float)\n",
+    test='''import unittest
+import numpy as np
+
+class TestCases(unittest.TestCase):
+    def test_strings(self):
+        result = task_func(["1", "2.5", "3"])
+        np.testing.assert_array_equal(result, np.array([1.0, 2.5, 3.0]))
+        self.assertEqual(result.dtype, np.float64)
+
+    def test_ints(self):
+        result = task_func([1, 2, 3])
+        np.testing.assert_array_equal(result, np.array([1.0, 2.0, 3.0]))
+
+    def test_mixed(self):
+        result = task_func([0.5, 1, "2.5"])
+        np.testing.assert_array_equal(result, np.array([0.5, 1.0, 2.5]))
+''',
+)
+
+
+# ===== Pandas 2.0 read_csv arg removals =====
+
+_add(
+    case_id="manual_012",
+    task_id="Manual/012",
+    libs=["pandas", "io"],
+    library_under_test="pandas",
+    bad_version="2.2.2", good_version="1.5.3",
+    error_type="TypeError", kind="removal", rule_label="pd_error_bad_lines",
+    reason="pd.read_csv error_bad_lines= removed in pandas 2.0; use on_bad_lines='skip'",
+    evidence_line="    return pd.read_csv(io.StringIO(csv_text), error_bad_lines=False)",
+    instruct_prompt=(
+        "Parse a CSV string that may contain malformed lines. Skip bad lines "
+        "silently and return the resulting DataFrame."
+    ),
+    code_prompt="import io\nimport pandas as pd\n\ndef task_func(csv_text):\n",
+    canonical_solution=(
+        "    return pd.read_csv(io.StringIO(csv_text), error_bad_lines=False)\n"
+    ),
+    correct_solution=(
+        "    return pd.read_csv(io.StringIO(csv_text), on_bad_lines='skip')\n"
+    ),
+    test='''import unittest
+import pandas as pd
+
+class TestCases(unittest.TestCase):
+    def test_clean(self):
+        df = task_func("a,b\\n1,2\\n3,4\\n")
+        self.assertEqual(len(df), 2)
+        self.assertEqual(list(df.columns), ["a", "b"])
+
+    def test_with_bad_line(self):
+        df = task_func("a,b\\n1,2\\n3,4,5\\n6,7\\n")
+        # Bad line (3,4,5) skipped; 2 good rows remain
+        self.assertEqual(len(df), 2)
+''',
+)
+
+
+# ===== sklearn 1.2 linear-model normalize= removal =====
+
+_add(
+    case_id="manual_013",
+    task_id="Manual/013",
+    libs=["numpy", "sklearn"],
+    library_under_test="scikit-learn",
+    bad_version="1.4.2", good_version="1.1.3",
+    error_type="TypeError", kind="removal", rule_label="skl_lr_normalize",
+    reason="LinearRegression normalize= removed in sklearn 1.2; use a Pipeline with StandardScaler",
+    evidence_line="    model = LinearRegression(normalize=True)",
+    instruct_prompt=(
+        "Fit a linear regression on (X, y) with input features pre-scaled "
+        "(standardized) so the regression coefficients are on a comparable scale. "
+        "Return the predictions for X_test."
+    ),
+    code_prompt=(
+        "import numpy as np\n"
+        "from sklearn.linear_model import LinearRegression\n\n"
+        "def task_func(X, y, X_test):\n"
+    ),
+    canonical_solution=(
+        "    model = LinearRegression(normalize=True)\n"
+        "    model.fit(X, y)\n"
+        "    return model.predict(X_test)\n"
+    ),
+    correct_solution=(
+        "    from sklearn.preprocessing import StandardScaler\n"
+        "    from sklearn.pipeline import make_pipeline\n"
+        "    pipe = make_pipeline(StandardScaler(), LinearRegression())\n"
+        "    pipe.fit(X, y)\n"
+        "    return pipe.predict(X_test)\n"
+    ),
+    test='''import unittest
+import numpy as np
+
+class TestCases(unittest.TestCase):
+    def test_simple_linear(self):
+        # y = 2x, prediction at x=5 should be ~10
+        X = np.array([[1.0], [2.0], [3.0], [4.0]])
+        y = np.array([2.0, 4.0, 6.0, 8.0])
+        X_test = np.array([[5.0]])
+        result = task_func(X, y, X_test)
+        self.assertEqual(result.shape, (1,))
+        self.assertAlmostEqual(float(result[0]), 10.0, places=2)
+
+    def test_two_features(self):
+        # y = x1 + x2
+        X = np.array([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]])
+        y = np.array([2.0, 4.0, 6.0, 8.0])
+        X_test = np.array([[5.0, 5.0]])
+        result = task_func(X, y, X_test)
+        self.assertAlmostEqual(float(result[0]), 10.0, places=1)
+''',
+)
+
+
+# ===== matplotlib 3.9 register_cmap removal =====
+
+_add(
+    case_id="manual_014",
+    task_id="Manual/014",
+    libs=["matplotlib"],
+    library_under_test="matplotlib",
+    bad_version="3.9.2", good_version="3.8.4",
+    error_type="ImportError", kind="removal", rule_label="mpl_register_cmap",
+    reason="matplotlib.cm.register_cmap removed in matplotlib 3.9; use matplotlib.colormaps.register",
+    evidence_line="    from matplotlib.cm import register_cmap",
+    instruct_prompt=(
+        "Register a custom colormap built from the given color list under the "
+        "given name, then return the registered colormap object via "
+        "matplotlib.pyplot.get_cmap."
+    ),
+    code_prompt=(
+        "import matplotlib.pyplot as plt\n"
+        "from matplotlib.colors import LinearSegmentedColormap\n\n"
+        "def task_func(name, colors):\n"
+    ),
+    canonical_solution=(
+        "    from matplotlib.cm import register_cmap\n"
+        "    cmap = LinearSegmentedColormap.from_list(name, colors)\n"
+        "    register_cmap(name=name, cmap=cmap)\n"
+        "    return plt.get_cmap(name)\n"
+    ),
+    correct_solution=(
+        "    import matplotlib as mpl\n"
+        "    cmap = LinearSegmentedColormap.from_list(name, colors)\n"
+        "    mpl.colormaps.register(cmap, name=name)\n"
+        "    return plt.get_cmap(name)\n"
+    ),
+    test='''import unittest
+from matplotlib.colors import Colormap
+
+class TestCases(unittest.TestCase):
+    def test_basic(self):
+        cmap = task_func("test_cmap_basic", ["red", "blue"])
+        self.assertIsInstance(cmap, Colormap)
+        self.assertEqual(cmap.name, "test_cmap_basic")
+
+    def test_three_colors(self):
+        cmap = task_func("test_cmap_three", ["red", "green", "blue"])
+        self.assertIsInstance(cmap, Colormap)
+        # Check colormap is callable and produces colors
+        c0 = cmap(0.0)
+        c1 = cmap(1.0)
+        self.assertEqual(len(c0), 4)  # RGBA
+        self.assertNotEqual(c0, c1)
+''',
+)
+
+
+# ===== scipy 1.12 signal.gaussian removal =====
+
+_add(
+    case_id="manual_015",
+    task_id="Manual/015",
+    libs=["numpy", "scipy"],
+    library_under_test="scipy",
+    bad_version="1.13.1", good_version="1.11.4",
+    error_type="ImportError", kind="removal", rule_label="scipy_signal_gaussian",
+    reason="scipy.signal.gaussian removed in SciPy 1.12; use scipy.signal.windows.gaussian",
+    evidence_line="    from scipy.signal import gaussian",
+    instruct_prompt=(
+        "Build a Gaussian window of length M with standard deviation std, "
+        "and return it as a numpy array."
+    ),
+    code_prompt="import numpy as np\n\ndef task_func(M, std):\n",
+    canonical_solution=(
+        "    from scipy.signal import gaussian\n"
+        "    return gaussian(M, std)\n"
+    ),
+    correct_solution=(
+        "    from scipy.signal.windows import gaussian\n"
+        "    return gaussian(M, std)\n"
+    ),
+    test='''import unittest
+import numpy as np
+
+class TestCases(unittest.TestCase):
+    def test_length(self):
+        w = task_func(11, 2.0)
+        self.assertEqual(len(w), 11)
+
+    def test_peak_at_center(self):
+        w = task_func(11, 2.0)
+        # Gaussian window peaks at the center
+        self.assertEqual(np.argmax(w), 5)
+        self.assertAlmostEqual(float(w[5]), 1.0, places=5)
+
+    def test_symmetric(self):
+        w = task_func(9, 1.5)
+        np.testing.assert_array_almost_equal(w, w[::-1])
 ''',
 )
 
