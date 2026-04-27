@@ -1,5 +1,7 @@
 # Virtual environments (per-case isolated envs)
 environments/
+benchmark/envs/
+benchmark/verification_report.json
 
 # Generated test scripts (created at runtime)
 test_cases/generated/
