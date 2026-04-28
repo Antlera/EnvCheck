@@ -35,7 +35,12 @@ MAX_PLAN_ATTEMPTS = 2  # plan ↔ preflight retry cap (each retry = 1 LLM call)
 
 # Per-run instrumentation for benchmark eval.
 # Reset at the start of each EnvPilot run, then read after invoke().
-_metrics: dict[str, int] = {
+# `node_tokens` / `node_calls` are dicts keyed by node name (analysis,
+# env_probe, kb_query, kb_update, plan, generation) so we can attribute
+# tokens to each phase — useful for distinguishing "task work" from
+# "KB-population work" (kb_update is the only node whose output is a side
+# effect on the local KB rather than the current task's solution).
+_metrics: dict = {
     "llm_calls": 0,
     "input_tokens": 0,
     "output_tokens": 0,
@@ -43,18 +48,43 @@ _metrics: dict[str, int] = {
     "web_search_calls": 0,
     "preflight_runs": 0,
     "kb_query_calls": 0,
+    "node_tokens": {},   # node_name -> total tokens used by that node
+    "node_calls": {},    # node_name -> LLM call count for that node
 }
 
 
 def reset_metrics() -> None:
     """Zero out all instrumentation counters. Call before each pipeline run."""
-    for k in _metrics:
-        _metrics[k] = 0
+    for k in list(_metrics.keys()):
+        if isinstance(_metrics[k], dict):
+            _metrics[k] = {}
+        else:
+            _metrics[k] = 0
 
 
-def get_metrics() -> dict[str, int]:
-    """Snapshot current counters."""
-    return dict(_metrics)
+def get_metrics() -> dict:
+    """Snapshot current counters (deep-copies the per-node dicts)."""
+    snap = dict(_metrics)
+    snap["node_tokens"] = dict(_metrics["node_tokens"])
+    snap["node_calls"] = dict(_metrics["node_calls"])
+    return snap
+
+
+def _record_usage(response, node: str = "") -> None:
+    """Update global + per-node counters from a langchain AIMessage response."""
+    _metrics["llm_calls"] += 1
+    usage = getattr(response, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        return
+    in_t = int(usage.get("input_tokens") or 0)
+    out_t = int(usage.get("output_tokens") or 0)
+    tot_t = int(usage.get("total_tokens") or 0)
+    _metrics["input_tokens"] += in_t
+    _metrics["output_tokens"] += out_t
+    _metrics["total_tokens"] += tot_t
+    if node:
+        _metrics["node_tokens"][node] = _metrics["node_tokens"].get(node, 0) + tot_t
+        _metrics["node_calls"][node] = _metrics["node_calls"].get(node, 0) + 1
 
 
 def _get_llm(model: str = "gemini-2.5-flash") -> ChatGoogleGenerativeAI:
@@ -75,22 +105,19 @@ def _parse_json_response(text: str) -> dict:
     return json.loads(cleaned)
 
 
-def _llm_call(prompt: str) -> dict:
-    """Make an LLM call and parse the JSON response."""
+def _llm_call(prompt: str, node: str = "") -> dict:
+    """Make an LLM call and parse the JSON response.
+
+    `node` attributes the call's tokens to a specific phase in the per-node
+    breakdown.
+    """
     llm = _get_llm()
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ]
     response = llm.invoke(messages)
-
-    # Instrumentation: count call + tokens for benchmark eval.
-    _metrics["llm_calls"] += 1
-    usage = getattr(response, "usage_metadata", None)
-    if isinstance(usage, dict):
-        _metrics["input_tokens"] += int(usage.get("input_tokens") or 0)
-        _metrics["output_tokens"] += int(usage.get("output_tokens") or 0)
-        _metrics["total_tokens"] += int(usage.get("total_tokens") or 0)
+    _record_usage(response, node)
 
     text = response.content
     if isinstance(text, list):
@@ -112,7 +139,7 @@ def analysis_node(state: EnvPilotState) -> dict[str, Any]:
     prompt = ANALYSIS_PROMPT.format(task_description=state["task_description"])
 
     try:
-        result = _llm_call(prompt)
+        result = _llm_call(prompt, node="analysis")
         return {
             "identified_packages": result.get("identified_packages", []),
             "critical_apis": result.get("critical_apis", []),
@@ -182,7 +209,7 @@ def env_probe_node(state: EnvPilotState) -> dict[str, Any]:
     # LLM analysis of env results
     prompt = ENV_PROBE_ANALYSIS_PROMPT.format(env_info=json.dumps(env_info, indent=2))
     try:
-        llm_result = _llm_call(prompt)
+        llm_result = _llm_call(prompt, node="env_probe")
         updated_uncertainty = llm_result.get(
             "updated_uncertainty_score", state.get("uncertainty_score", 50)
         )
@@ -223,7 +250,7 @@ def kb_query_node(state: EnvPilotState) -> dict[str, Any]:
 
     kb_has_gaps = False
     try:
-        llm_result = _llm_call(prompt)
+        llm_result = _llm_call(prompt, node="kb_query")
         kb_has_gaps = llm_result.get("kb_has_gaps", False)
         updated_uncertainty = llm_result.get(
             "updated_uncertainty_score", state.get("uncertainty_score", 50)
@@ -289,7 +316,7 @@ def kb_update_node(state: EnvPilotState) -> dict[str, Any]:
 
     kb_updates: list[dict] = []
     try:
-        llm_result = _llm_call(prompt)
+        llm_result = _llm_call(prompt, node="kb_update")
         rules_to_upsert = llm_result.get("rules_to_upsert", [])
 
         if rules_to_upsert:
@@ -331,7 +358,7 @@ def kb_update_node(state: EnvPilotState) -> dict[str, Any]:
 # Phase 4: Pre-flight Verification
 # ============================================================================
 
-def _llm_call_raw(prompt: str) -> str:
+def _llm_call_raw(prompt: str, node: str = "") -> str:
     """Call the LLM and return raw text (no JSON parse). Updates metrics."""
     llm = _get_llm()
     messages = [
@@ -339,13 +366,7 @@ def _llm_call_raw(prompt: str) -> str:
         HumanMessage(content=prompt),
     ]
     response = llm.invoke(messages)
-
-    _metrics["llm_calls"] += 1
-    usage = getattr(response, "usage_metadata", None)
-    if isinstance(usage, dict):
-        _metrics["input_tokens"] += int(usage.get("input_tokens") or 0)
-        _metrics["output_tokens"] += int(usage.get("output_tokens") or 0)
-        _metrics["total_tokens"] += int(usage.get("total_tokens") or 0)
+    _record_usage(response, node)
 
     text = response.content
     if isinstance(text, list):
@@ -420,7 +441,7 @@ def plan_node(state: EnvPilotState) -> dict[str, Any]:
     )
 
     try:
-        result = _llm_call(prompt)
+        result = _llm_call(prompt, node="plan")
         proposed = result.get("proposed_apis") or []
         # Sanitize: must be list of strings with dots
         proposed = [a for a in proposed if isinstance(a, str) and "." in a]
@@ -575,7 +596,7 @@ def generation_node(state: EnvPilotState) -> dict[str, Any]:
     # Same fenced-markdown trick as preflight: avoid JSON-escaping Python code
     # (regex patterns / quotes / backslashes constantly break json.loads).
     try:
-        text = _llm_call_raw(prompt)
+        text = _llm_call_raw(prompt, node="generation")
         final_code = _extract_fenced_python(text)
         # Try to find a NOTES: line for logging
         import re as _re

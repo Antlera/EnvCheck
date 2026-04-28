@@ -90,6 +90,11 @@ class RunRecord:
     output_tokens: int = 0
     total_tokens: int = 0
 
+    # Per-node token breakdown (envpilot only; baseline uses 'baseline' bucket).
+    # Keys: analysis / env_probe / kb_query / kb_update / plan / generation / baseline
+    node_tokens: dict = field(default_factory=dict)
+    node_calls: dict = field(default_factory=dict)
+
     # First-pass success: passed on the FIRST generation attempt.
     # baseline: iter 0 passes. envpilot: preflight_attempts <= 1 and passed.
     first_pass_success: bool = False
@@ -161,8 +166,12 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 def _llm_invoke(prompt: str) -> tuple[str, str]:
-    """Single Gemini call. Returns (text, error_str). Updates _metrics."""
-    from envcheck.agent.nodes import _get_llm, _metrics
+    """Single Gemini call for baseline. Returns (text, error_str).
+
+    Tags tokens under node='baseline' so per-node breakdown distinguishes
+    baseline iterations from EnvPilot's graph nodes in the same metrics dict.
+    """
+    from envcheck.agent.nodes import _get_llm, _record_usage
     from langchain_core.messages import HumanMessage, SystemMessage
 
     try:
@@ -173,12 +182,7 @@ def _llm_invoke(prompt: str) -> tuple[str, str]:
     except Exception as e:
         return "", f"{type(e).__name__}: {e}"
 
-    _metrics["llm_calls"] += 1
-    usage = getattr(response, "usage_metadata", None)
-    if isinstance(usage, dict):
-        _metrics["input_tokens"] += int(usage.get("input_tokens") or 0)
-        _metrics["output_tokens"] += int(usage.get("output_tokens") or 0)
-        _metrics["total_tokens"] += int(usage.get("total_tokens") or 0)
+    _record_usage(response, node="baseline")
 
     text = response.content
     if isinstance(text, list):
@@ -385,6 +389,8 @@ def run_one(case: dict, mode: str, repeat: int = 0,
         input_tokens=int(metrics.get("input_tokens", 0)),
         output_tokens=int(metrics.get("output_tokens", 0)),
         total_tokens=int(metrics.get("total_tokens", 0)),
+        node_tokens=dict(metrics.get("node_tokens") or {}),
+        node_calls=dict(metrics.get("node_calls") or {}),
         first_pass_success=first_pass,
     )
 
@@ -407,6 +413,18 @@ def aggregate(records: list[RunRecord]) -> dict:
         first_pass = [r for r in rs if r.first_pass_success]
         crashed = [r for r in rs if r.test_crashed]
 
+        # Aggregate per-node tokens. We surface ALL node names that appear
+        # across any record; missing keys count as 0.
+        all_nodes = sorted({k for r in rs for k in r.node_tokens.keys()})
+        node_token_means = {
+            node: _safe_mean([r.node_tokens.get(node, 0) for r in rs])
+            for node in all_nodes
+        }
+        node_call_means = {
+            node: _safe_mean([r.node_calls.get(node, 0) for r in rs])
+            for node in all_nodes
+        }
+
         summary[mode] = {
             "n_runs": n,
             "n_unique_cases": len({r.case_id for r in rs}),
@@ -424,6 +442,12 @@ def aggregate(records: list[RunRecord]) -> dict:
             "mean_web_search":   _safe_mean([r.web_search_calls for r in rs]),
             "mean_preflight":    _safe_mean([r.preflight_runs for r in rs]),
             "mean_attempts":     _safe_mean([r.preflight_attempts for r in rs]),
+
+            # Per-node token attribution. For envpilot, kb_update tokens are
+            # "KB-population work" (benefits future runs); the rest are
+            # "task work" for this case.
+            "mean_node_tokens": node_token_means,
+            "mean_node_calls":  node_call_means,
         }
 
     # Overhead vs. repair savings — only meaningful with both modes
