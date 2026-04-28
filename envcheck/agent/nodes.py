@@ -18,6 +18,7 @@ from envcheck.agent.prompts import (
     GENERATION_PROMPT,
     KB_ANALYSIS_PROMPT,
     KB_UPDATE_PROMPT,
+    PLAN_PROMPT,
     PREFLIGHT_PROMPT,
     SYSTEM_PROMPT,
 )
@@ -30,6 +31,7 @@ from envcheck.web_searcher import WebSearcher
 logger = logging.getLogger("envpilot")
 
 MAX_PREFLIGHT_ATTEMPTS = 3
+MAX_PLAN_ATTEMPTS = 2  # plan ↔ preflight retry cap (each retry = 1 LLM call)
 
 # Per-run instrumentation for benchmark eval.
 # Reset at the start of each EnvPilot run, then read after invoke().
@@ -113,6 +115,7 @@ def analysis_node(state: EnvPilotState) -> dict[str, Any]:
         result = _llm_call(prompt)
         return {
             "identified_packages": result.get("identified_packages", []),
+            "critical_apis": result.get("critical_apis", []),
             "uncertainty_score": result.get("uncertainty_score", 50),
             "phase": "analysis_complete",
             "messages": [HumanMessage(content=f"[Analysis] {json.dumps(result, indent=2)}")],
@@ -121,6 +124,7 @@ def analysis_node(state: EnvPilotState) -> dict[str, Any]:
         logger.error(f"Analysis failed: {e}")
         return {
             "identified_packages": [],
+            "critical_apis": [],
             "uncertainty_score": 80,
             "phase": "analysis_error",
             "error": str(e),
@@ -327,9 +331,194 @@ def kb_update_node(state: EnvPilotState) -> dict[str, Any]:
 # Phase 4: Pre-flight Verification
 # ============================================================================
 
+def _llm_call_raw(prompt: str) -> str:
+    """Call the LLM and return raw text (no JSON parse). Updates metrics."""
+    llm = _get_llm()
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=prompt),
+    ]
+    response = llm.invoke(messages)
+
+    _metrics["llm_calls"] += 1
+    usage = getattr(response, "usage_metadata", None)
+    if isinstance(usage, dict):
+        _metrics["input_tokens"] += int(usage.get("input_tokens") or 0)
+        _metrics["output_tokens"] += int(usage.get("output_tokens") or 0)
+        _metrics["total_tokens"] += int(usage.get("total_tokens") or 0)
+
+    text = response.content
+    if isinstance(text, list):
+        text = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in text
+        )
+    return text
+
+
+def _extract_fenced_python(text: str) -> str:
+    """Pull a Python code block out of a fenced response.
+
+    Robust to:
+      - properly closed fences:    ```python\n...\n```
+      - missing closing fence:     ```python\n...   (LLM truncated)
+      - leading/trailing prose
+      - both ```python and bare ``` openers
+    """
+    import re
+    text = text.strip()
+
+    # Try closed fence first (greedy enough to grab full code, ?: non-capturing).
+    m = re.search(r"```(?:python)?\s*\n(.*?)\n```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # Open fence but no close — strip the opener and use everything after.
+    m = re.search(r"```(?:python)?\s*\n(.*)$", text, re.DOTALL)
+    if m:
+        body = m.group(1)
+        # Trim trailing stray backticks if any.
+        body = re.sub(r"\n?```\s*$", "", body)
+        return body.strip()
+
+    # No fence at all — return raw (LLM ignored the format instruction).
+    return text
+
+
+def plan_node(state: EnvPilotState) -> dict[str, Any]:
+    """Synthesize env_info + KB + web findings into a concrete API plan.
+
+    Output: `proposed_apis` — dotted paths the agent will actually use in the
+    final code. Preflight then verifies each exists in bad_env. If preflight
+    fails, control returns here with the failure stdout fed back via
+    `previous_attempt`, and the LLM picks different alternatives.
+    """
+    logger.info("[Phase 3d] Planning concrete API set...")
+    attempts = state.get("plan_attempts", 0) + 1
+
+    # If a prior plan attempt failed preflight, feed the failure back so the
+    # LLM doesn't propose the same broken APIs again.
+    prev_block = ""
+    prev_apis = state.get("proposed_apis") or []
+    prev_pf = state.get("preflight_result") or {}
+    if attempts > 1 and prev_apis and not prev_pf.get("success"):
+        stdout = (prev_pf.get("stdout") or "")[:1500]
+        prev_block = (
+            "PREVIOUS ATTEMPT FAILED.\n"
+            f"You proposed: {prev_apis}\n"
+            f"Preflight output:\n{stdout}\n"
+            "Pick different APIs that ACTUALLY EXIST in the env."
+        )
+
+    prompt = PLAN_PROMPT.format(
+        task_description=state["task_description"],
+        env_info=json.dumps(state.get("env_info", {}), indent=2),
+        critical_apis=json.dumps(state.get("critical_apis") or [], indent=2),
+        kb_results=json.dumps(state.get("kb_results") or [], indent=2),
+        web_results=json.dumps((state.get("web_results") or [])[:5], indent=2),
+        previous_attempt=prev_block,
+    )
+
+    try:
+        result = _llm_call(prompt)
+        proposed = result.get("proposed_apis") or []
+        # Sanitize: must be list of strings with dots
+        proposed = [a for a in proposed if isinstance(a, str) and "." in a]
+        if not proposed:
+            # Fallback: trust the original critical_apis from analysis
+            proposed = state.get("critical_apis") or []
+        return {
+            "proposed_apis": proposed,
+            "plan_attempts": attempts,
+            "phase": "planned",
+            "messages": [HumanMessage(
+                content=f"[Plan attempt {attempts}] proposed_apis={proposed}"
+            )],
+        }
+    except Exception as e:
+        logger.warning(f"Plan LLM failed: {e}")
+        return {
+            "proposed_apis": state.get("critical_apis") or [],
+            "plan_attempts": attempts,
+            "phase": "plan_error",
+            "error": str(e),
+            "messages": [HumanMessage(content=f"[Plan Error] {e}")],
+        }
+
+
+def _build_deterministic_preflight(critical_apis: list[str],
+                                    identified_packages: list[str]) -> str:
+    """Build a deterministic preflight smoke test from analysis output.
+
+    For each `identified_package`, try `importlib.import_module`. For each
+    dotted `critical_api` (e.g. 'seaborn.histplot', 'pandas.DataFrame.append'),
+    walk the dotted path with getattr — AttributeError or ImportError is
+    recorded. Subprocess exit code = number of failures.
+
+    No LLM call. Always produces valid Python. The stdout cleanly enumerates
+    which APIs are missing, so the generation node can read it and avoid
+    those symbols in the final code.
+    """
+    lines = [
+        "import importlib",
+        "import sys",
+        "",
+        "_failures = []",
+        "_passed = []",
+        "",
+    ]
+
+    for pkg in identified_packages:
+        if not pkg or not isinstance(pkg, str):
+            continue
+        lines += [
+            f"try:",
+            f"    importlib.import_module({pkg!r})",
+            f"    _passed.append('import {pkg}')",
+            f"except Exception as _e:",
+            f"    _failures.append('import ' + {pkg!r} + ': ' + repr(_e))",
+            "",
+        ]
+
+    for api in critical_apis:
+        if not api or not isinstance(api, str) or "." not in api:
+            continue
+        mod, _, attrs = api.partition(".")
+        attr_path = attrs.split(".")
+        lines.append(f"# {api}")
+        lines.append("try:")
+        lines.append(f"    _o = importlib.import_module({mod!r})")
+        for attr in attr_path:
+            lines.append(f"    _o = getattr(_o, {attr!r})")
+        lines.append(f"    _passed.append({api!r})")
+        lines.append("except Exception as _e:")
+        lines.append(f"    _failures.append({api!r} + ': ' + repr(_e))")
+        lines.append("")
+
+    lines += [
+        "for p in _passed:",
+        "    print('PASS:', p)",
+        "for f in _failures:",
+        "    print('FAIL:', f)",
+        "",
+        "if _failures:",
+        "    print(f'--- PREFLIGHT FAILED: {len(_failures)} broken API(s) ---')",
+        "    sys.exit(1)",
+        "else:",
+        "    print(f'--- PREFLIGHT PASSED: {len(_passed)} check(s) ---')",
+    ]
+    return "\n".join(lines)
+
+
 def preflight_node(state: EnvPilotState) -> dict[str, Any]:
-    """Generate and run a preflight smoke test."""
-    logger.info("[Phase 4] Running preflight verification...")
+    """Run a deterministic preflight smoke test built from analysis output.
+
+    No LLM call: we already know the critical APIs from `analysis_node`. We
+    just walk each dotted path with importlib + getattr and report which
+    fail. The result (stdout enumerating PASS/FAIL per API) is fed to the
+    generation node so it knows exactly which symbols to avoid.
+    """
+    logger.info("[Phase 4] Running deterministic preflight verification...")
     _metrics["preflight_runs"] += 1
 
     attempts = state.get("preflight_attempts", 0) + 1
@@ -343,24 +532,13 @@ def preflight_node(state: EnvPilotState) -> dict[str, Any]:
             "messages": [HumanMessage(content="[Preflight] Skipped (no env_path)")],
         }
 
-    prompt = PREFLIGHT_PROMPT.format(
-        env_info=json.dumps(state.get("env_info", {}), indent=2),
-        kb_results=json.dumps(state.get("kb_results", []), indent=2),
-        web_results=json.dumps(state.get("web_results", []), indent=2),
-        task_description=state["task_description"],
+    # Test the APIs the plan node proposed. Falls back to original
+    # critical_apis if plan ran into trouble (still informative).
+    apis_to_test = state.get("proposed_apis") or state.get("critical_apis") or []
+    code = _build_deterministic_preflight(
+        critical_apis=apis_to_test,
+        identified_packages=state.get("identified_packages") or [],
     )
-
-    try:
-        llm_result = _llm_call(prompt)
-        code = llm_result.get("preflight_code", "")
-    except Exception as e:
-        return {
-            "preflight_result": {"success": False, "error": str(e)},
-            "preflight_attempts": attempts,
-            "phase": "preflight_failed",
-            "error": str(e),
-            "messages": [HumanMessage(content=f"[Preflight] LLM failed: {e}")],
-        }
 
     result = run_preflight(code, env_path)
     result_dict = preflight_to_dict(result)
@@ -373,7 +551,8 @@ def preflight_node(state: EnvPilotState) -> dict[str, Any]:
         "preflight_attempts": attempts,
         "phase": phase,
         "messages": [HumanMessage(
-            content=f"[Preflight] {'PASSED' if result.success else 'FAILED'}: {result_dict}"
+            content=f"[Preflight] {'PASSED' if result.success else 'FAILED'}: "
+                    f"{result_dict.get('stdout', '')[:500]}"
         )],
     }
 
@@ -393,10 +572,17 @@ def generation_node(state: EnvPilotState) -> dict[str, Any]:
         task_description=state["task_description"],
     )
 
+    # Same fenced-markdown trick as preflight: avoid JSON-escaping Python code
+    # (regex patterns / quotes / backslashes constantly break json.loads).
     try:
-        llm_result = _llm_call(prompt)
-        final_code = llm_result.get("final_code", "")
-        notes = llm_result.get("notes", "")
+        text = _llm_call_raw(prompt)
+        final_code = _extract_fenced_python(text)
+        # Try to find a NOTES: line for logging
+        import re as _re
+        m = _re.search(r"NOTES:\s*(.+)", text)
+        notes = m.group(1).strip() if m else ""
+        if not final_code:
+            raise ValueError("Empty final_code from LLM")
     except Exception as e:
         return {
             "final_code": "",
@@ -419,25 +605,28 @@ def generation_node(state: EnvPilotState) -> dict[str, Any]:
 # ============================================================================
 
 def route_after_kb_query(state: EnvPilotState) -> str:
-    """Decide whether to web search or go straight to preflight."""
+    """If KB has gaps or LLM is uncertain, search web first; otherwise plan."""
     uncertainty = state.get("uncertainty_score", 50)
     kb_has_gaps = state.get("kb_has_gaps", False)
 
     if uncertainty > 20 or kb_has_gaps:
         return "web_search"
-    return "preflight"
+    return "plan"
 
 
 def route_after_preflight(state: EnvPilotState) -> str:
-    """Decide whether to retry analysis or proceed to generation."""
+    """If all proposed APIs verified, generate. Otherwise loop back to plan
+    (with the failure stdout) to pick different alternatives, capped at
+    MAX_PLAN_ATTEMPTS to prevent infinite loops."""
     result = state.get("preflight_result", {})
-    attempts = state.get("preflight_attempts", 0)
+    plan_attempts = state.get("plan_attempts", 0)
 
     if result.get("success", False):
         return "generation"
-
-    if attempts >= MAX_PREFLIGHT_ATTEMPTS:
-        logger.warning(f"Max preflight attempts ({MAX_PREFLIGHT_ATTEMPTS}) reached, proceeding anyway")
+    if plan_attempts >= MAX_PLAN_ATTEMPTS:
+        logger.warning(
+            f"Max plan attempts ({MAX_PLAN_ATTEMPTS}) reached, "
+            "proceeding to generation with the partial info we have."
+        )
         return "generation"
-
-    return "analysis"
+    return "plan"

@@ -21,6 +21,7 @@ class EnvPilotState(TypedDict):
 
     # Phase 1: Analysis
     identified_packages: list[str]
+    critical_apis: list[str]  # dotted paths e.g. "seaborn.histplot", "pandas.DataFrame.append"
     uncertainty_score: int  # 0-100
 
     # Phase 2: Environment Probing
@@ -32,6 +33,10 @@ class EnvPilotState(TypedDict):
     kb_has_gaps: bool
     web_results: list[dict[str, Any]]
     kb_updates: list[dict[str, Any]]
+
+    # Phase 3d: Plan — synthesize env + KB + web into a concrete API list
+    proposed_apis: list[str]  # dotted paths the agent intends to actually use
+    plan_attempts: int        # plan ↔ preflight loop counter
 
     # Phase 4: Preflight
     preflight_code: str

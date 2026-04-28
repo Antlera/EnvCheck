@@ -14,6 +14,7 @@ Usage:
     print(result.success, result.stdout)
 """
 
+import os
 import subprocess
 import tempfile
 import time
@@ -68,6 +69,13 @@ def run_preflight(
         f.write(code)
         script_path = Path(f.name)
 
+    # Force a non-interactive matplotlib backend. Without this, importing
+    # matplotlib (transitively via seaborn etc.) on the python-build-standalone
+    # Python 3.8 build we use for legacy envs crashes on Tk init
+    # (`module '_tkinter' has no attribute '__file__'`), masking the *real*
+    # breaking-change error the smoke test was meant to surface.
+    env = {**os.environ, "MPLBACKEND": "Agg"}
+
     start = time.perf_counter()
     try:
         result = subprocess.run(
@@ -75,6 +83,7 @@ def run_preflight(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         duration_ms = (time.perf_counter() - start) * 1000
 

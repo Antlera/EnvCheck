@@ -34,6 +34,7 @@ from envcheck.agent.nodes import (
     generation_node,
     kb_query_node,
     kb_update_node,
+    plan_node,
     preflight_node,
     route_after_kb_query,
     route_after_preflight,
@@ -56,6 +57,7 @@ def build_graph() -> StateGraph:
     graph.add_node("kb_query", kb_query_node)
     graph.add_node("web_search", web_search_node)
     graph.add_node("kb_update", kb_update_node)
+    graph.add_node("plan", plan_node)
     graph.add_node("preflight", preflight_node)
     graph.add_node("generation", generation_node)
 
@@ -64,22 +66,27 @@ def build_graph() -> StateGraph:
     graph.add_edge("analysis", "env_probe")
     graph.add_edge("env_probe", "kb_query")
 
-    # Conditional: after KB query, either web_search or preflight
+    # Conditional: after KB query, either web_search (when info gaps) or
+    # straight to plan (when KB has enough).
     graph.add_conditional_edges(
         "kb_query",
         route_after_kb_query,
-        {"web_search": "web_search", "preflight": "preflight"},
+        {"web_search": "web_search", "plan": "plan"},
     )
 
-    # Web search -> KB update -> preflight
+    # Web search -> KB update -> plan
     graph.add_edge("web_search", "kb_update")
-    graph.add_edge("kb_update", "preflight")
+    graph.add_edge("kb_update", "plan")
 
-    # Conditional: after preflight, either retry analysis or generate
+    # Plan synthesizes proposed_apis, preflight verifies them deterministically
+    graph.add_edge("plan", "preflight")
+
+    # Conditional: preflight passed -> generation; failed -> back to plan
+    # (with failure feedback). Capped at MAX_PLAN_ATTEMPTS in route function.
     graph.add_conditional_edges(
         "preflight",
         route_after_preflight,
-        {"analysis": "analysis", "generation": "generation"},
+        {"plan": "plan", "generation": "generation"},
     )
 
     # Generation -> END
@@ -105,6 +112,7 @@ def get_default_initial_state(
         "task_description": task_description,
         "messages": [],
         "identified_packages": [],
+        "critical_apis": [],
         "uncertainty_score": 50,
         "env_path": env_path,
         "env_info": {},
@@ -112,6 +120,8 @@ def get_default_initial_state(
         "kb_has_gaps": False,
         "web_results": [],
         "kb_updates": [],
+        "proposed_apis": [],
+        "plan_attempts": 0,
         "preflight_code": "",
         "preflight_result": {},
         "preflight_attempts": 0,

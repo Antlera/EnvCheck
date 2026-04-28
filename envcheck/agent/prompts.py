@@ -78,11 +78,50 @@ Respond with ONLY a valid JSON object (no markdown fencing):
 }}
 """
 
+PLAN_PROMPT = """\
+You have probed the target environment and looked up breaking-change rules. \
+Now decide which exact dotted-path APIs you intend to use in the final code, \
+choosing alternatives that EXIST in the env's installed package versions.
+
+Rules:
+- Output dotted paths only (e.g. "seaborn.distplot", "pandas.DataFrame.ffill").
+- For each task-relevant operation, pick ONE concrete API to use.
+- If KB / web indicates an API was removed in the env's version, pick its \
+replacement instead (e.g. seaborn 0.10.1 has no histplot → use distplot).
+- Don't propose APIs you have no reason to believe exist.
+
+Task:
+{task_description}
+
+Environment:
+{env_info}
+
+Originally identified APIs (from task analysis, may include broken ones):
+{critical_apis}
+
+KB rules (breaking changes we know about):
+{kb_results}
+
+Web search findings (if any):
+{web_results}
+
+{previous_attempt}
+
+Respond with ONLY a valid JSON object (no markdown fencing):
+{{
+    "proposed_apis": ["library.symbol", "library.Class.method", ...],
+    "reasoning": "one sentence why these APIs",
+    "uncertainty_score": <0-100>
+}}
+"""
+
+
 PREFLIGHT_PROMPT = """\
 Based on the analysis so far, write a minimal smoke test script that verifies \
 the most "at-risk" part of the planned code. The script should:
 1. Import the critical packages
-2. Test the specific API calls that may have breaking changes
+2. Test the specific API calls that may have breaking changes (CALL the API,
+   don't just import — we need the actual breaking-change error to surface)
 3. Print a clear SUCCESS or FAILURE message
 
 Environment info:
@@ -96,18 +135,20 @@ Web search results (if any):
 
 Task: {task_description}
 
-Respond with ONLY a valid JSON object (no markdown fencing):
-{{
-    "preflight_code": "the python code to test",
-    "what_it_tests": "brief description"
-}}
+Output the smoke test as a single fenced Python code block. Do NOT use JSON;
+embed the full code inside the fence so quotes and backslashes don't need
+to be escaped. Format exactly:
+
+```python
+# your smoke test here
+```
 """
 
 GENERATION_PROMPT = """\
-All probes and tests have passed. Generate the final code for the task.
-
-IMPORTANT: The code MUST be context-aware, using the EXACT versions and API \
-signatures confirmed by the environment probes and preflight tests.
+Generate the final code for the task. The code MUST be context-aware, using \
+the EXACT versions and API signatures confirmed by the environment probes \
+and preflight tests below. If the preflight test failed, READ THE STDERR — \
+that is the actual breaking-change error you must avoid in your final code.
 
 Environment:
 {env_info}
@@ -120,12 +161,14 @@ Preflight test result:
 
 Task: {task_description}
 
-Generate the complete, production-ready Python code. Respond with ONLY a valid \
-JSON object (no markdown fencing):
-{{
-    "final_code": "the complete python code",
-    "notes": "any important notes about the implementation"
-}}
+Output the complete, production-ready Python code as a single fenced Python \
+code block. Do NOT use JSON. Format exactly:
+
+```python
+# your final code here (imports + function definition with body)
+```
+
+NOTES: one short line about implementation choices (optional).
 """
 
 KB_UPDATE_PROMPT = """\
