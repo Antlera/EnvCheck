@@ -103,24 +103,38 @@ SYSTEM_MSG = "You are an expert Python developer."
 
 
 def _build_baseline_prompt(instruct: str, entry_point: str,
+                            code_prompt: str,
                             history: list[tuple[str, str]]) -> str:
     """Compose the user prompt for one baseline iteration.
 
-    `history` is a list of (previous_code, traceback_tail) tuples from prior
-    failed attempts. Empty on iter 0.
+    `code_prompt` is BCB's scaffold (imports + def line + module-level
+    constants). It frames which libraries the LLM is required to use.
+    Without it, the LLM may bypass the target library entirely (e.g. solve
+    a "compute product" task with math.prod instead of numpy), which means
+    the breaking change is never exercised.
+
+    `history` is a list of (previous_code, traceback_tail) tuples from
+    prior failed attempts. Empty on iter 0.
     """
+    scaffold_block = (
+        f"You must use exactly these imports and this function signature:\n\n"
+        f"```python\n{code_prompt.rstrip()}\n```\n"
+    )
+
     if not history:
         return (
             f"Write a complete Python function named `{entry_point}` that "
             f"does the following:\n\n"
             f"{instruct}\n\n"
-            "Output ONLY the Python code (imports + function definition). "
-            "No markdown fences, no commentary, no explanation."
+            f"{scaffold_block}\n"
+            "Output the complete Python code (imports + function definition "
+            "with body). No markdown fences, no commentary, no explanation."
         )
 
     parts = [
         f"You're trying to write a Python function named `{entry_point}` "
-        f"for this task:\n\n{instruct}",
+        f"for this task:\n\n{instruct}\n\n"
+        f"{scaffold_block}",
     ]
     for i, (prev_code, prev_err) in enumerate(history):
         parts.append(f"\n--- Attempt {i + 1} (failed) ---\n{prev_code}")
@@ -128,7 +142,8 @@ def _build_baseline_prompt(instruct: str, entry_point: str,
                      f"the test suite was run:\n\n{prev_err}")
     parts.append(
         "\nFix the code and output the complete corrected function "
-        "(imports + def + body). No markdown fences, no commentary."
+        "(imports + def + body), still respecting the scaffold above. "
+        "No markdown fences, no commentary."
     )
     return "\n".join(parts)
 
@@ -189,6 +204,7 @@ def run_baseline(case: dict, bad_env_path: Path,
 
     instruct = case["instruct_prompt"]
     entry = case.get("entry_point") or "task_func"
+    code_prompt = case.get("code_prompt") or ""
 
     history: list[tuple[str, str]] = []
     final_code = ""
@@ -198,7 +214,7 @@ def run_baseline(case: dict, bad_env_path: Path,
 
     for iter_idx in range(max_iter):
         iterations_used = iter_idx + 1
-        prompt = _build_baseline_prompt(instruct, entry, history)
+        prompt = _build_baseline_prompt(instruct, entry, code_prompt, history)
         text, err = _llm_invoke(prompt)
         if err:
             return "", err, get_metrics(), iterations_used, last_score
@@ -230,9 +246,16 @@ def run_envpilot(case: dict, bad_env_path: Path) -> tuple[str, str, dict, dict]:
 
     reset_metrics()
     entry = case.get("entry_point") or "task_func"
+    code_prompt = (case.get("code_prompt") or "").rstrip()
+    # Same minimal spec the baseline gets: instruct + entry_point + the BCB
+    # scaffold (imports + signature + module constants). The scaffold pins
+    # which libraries the LLM must use so it can't sidestep the breaking
+    # change by switching to a different library.
     augmented_task = (
         f"{case['instruct_prompt']}\n\n"
-        f"Define a Python function named `{entry}`."
+        f"Define a Python function named `{entry}`. "
+        f"You must use exactly these imports and this signature:\n\n"
+        f"```python\n{code_prompt}\n```"
     )
 
     try:
