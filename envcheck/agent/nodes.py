@@ -31,6 +31,29 @@ logger = logging.getLogger("envpilot")
 
 MAX_PREFLIGHT_ATTEMPTS = 3
 
+# Per-run instrumentation for benchmark eval.
+# Reset at the start of each EnvPilot run, then read after invoke().
+_metrics: dict[str, int] = {
+    "llm_calls": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "web_search_calls": 0,
+    "preflight_runs": 0,
+    "kb_query_calls": 0,
+}
+
+
+def reset_metrics() -> None:
+    """Zero out all instrumentation counters. Call before each pipeline run."""
+    for k in _metrics:
+        _metrics[k] = 0
+
+
+def get_metrics() -> dict[str, int]:
+    """Snapshot current counters."""
+    return dict(_metrics)
+
 
 def _get_llm(model: str = "gemini-2.5-flash") -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(model=model, temperature=0, max_tokens=4096)
@@ -58,6 +81,15 @@ def _llm_call(prompt: str) -> dict:
         HumanMessage(content=prompt),
     ]
     response = llm.invoke(messages)
+
+    # Instrumentation: count call + tokens for benchmark eval.
+    _metrics["llm_calls"] += 1
+    usage = getattr(response, "usage_metadata", None)
+    if isinstance(usage, dict):
+        _metrics["input_tokens"] += int(usage.get("input_tokens") or 0)
+        _metrics["output_tokens"] += int(usage.get("output_tokens") or 0)
+        _metrics["total_tokens"] += int(usage.get("total_tokens") or 0)
+
     text = response.content
     if isinstance(text, list):
         text = "".join(
@@ -168,6 +200,7 @@ def env_probe_node(state: EnvPilotState) -> dict[str, Any]:
 def kb_query_node(state: EnvPilotState) -> dict[str, Any]:
     """Query the knowledge base for relevant breaking change rules."""
     logger.info("[Phase 3] Querying knowledge base...")
+    _metrics["kb_query_calls"] += 1
 
     store = KnowledgeBaseStore()
     packages = state.get("identified_packages", [])
@@ -211,6 +244,7 @@ def kb_query_node(state: EnvPilotState) -> dict[str, Any]:
 def web_search_node(state: EnvPilotState) -> dict[str, Any]:
     """Search the web for missing API documentation and breaking changes."""
     logger.info("[Phase 3b] Searching web for missing information...")
+    _metrics["web_search_calls"] += 1
 
     searcher = WebSearcher()
     packages = state.get("identified_packages", [])
@@ -296,6 +330,7 @@ def kb_update_node(state: EnvPilotState) -> dict[str, Any]:
 def preflight_node(state: EnvPilotState) -> dict[str, Any]:
     """Generate and run a preflight smoke test."""
     logger.info("[Phase 4] Running preflight verification...")
+    _metrics["preflight_runs"] += 1
 
     attempts = state.get("preflight_attempts", 0) + 1
     env_path = state.get("env_path", "")

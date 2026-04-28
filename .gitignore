@@ -2,6 +2,8 @@
 environments/
 benchmark/envs/
 benchmark/verification_report.json
+benchmark/eval_results.json
+benchmark/eval_summary.json
 
 # Generated test scripts (created at runtime)
 test_cases/generated/

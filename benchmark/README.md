@@ -76,6 +76,42 @@ Each entry is a dict:
 - `good_version` — documentation only (no `good_env` is built or run): the lib version where `canonical` works.
 - `verified` — `True` only if both: (1) `canonical + test` crashes in `bad_env` with `error_type` in stderr, and (2) `correct + test` passes in `bad_env`. Property (2) is what proves the case is *solvable* — it surfaces unsolvable cases (test depends on `bad_env`-incompatible behavior of an alternative API) automatically.
 
+## Running the eval
+
+`run_eval.py` runs each verified case under two modes and scores the output:
+
+- **`baseline`** — single LLM call (`gemini-2.5-flash`) given the task prompt + `pip freeze` of `bad_env`. No retries, no env probing, no preflight.
+- **`envpilot`** — full LangGraph pipeline (analysis → env_probe → kb_query → optional web_search → preflight → generation, with retry on preflight failure up to 3 attempts).
+
+The generated `final_code` from each mode is wrapped with the case's `code_prompt` + `test` and run inside `bad_env`.
+
+```bash
+export GOOGLE_API_KEY=...
+
+# Run one case both modes (smoke test, ~30–60s)
+uv run python benchmark/run_eval.py --case manual_011
+
+# All 24 cases × both modes × N=1 repeat (~15–30 min, ~300+ Gemini calls)
+uv run python benchmark/run_eval.py
+
+# Stability sampling: N=3 repeats per (case, mode) — recommended for the report
+uv run python benchmark/run_eval.py --n 3
+
+# Only one mode
+uv run python benchmark/run_eval.py --mode envpilot
+```
+
+Outputs:
+- `benchmark/eval_results.json` — one row per (case, mode, repeat) with `final_code`, `test_passed`, `duration_s`, `total_tokens`, `llm_calls`, `preflight_attempts`, etc.
+- `benchmark/eval_summary.json` — aggregate metrics:
+  - **Effectiveness**: `first_pass_success_rate` / `final_success_rate` / `crash_rate` per mode
+  - **Efficiency**: `mean_duration_s` / `mean_total_tokens` / `mean_llm_calls` / `mean_web_search` / `mean_preflight` / `mean_attempts` per mode
+  - **Delta** (envpilot − baseline): `token_overhead`, `tokens_per_extra_pass` (overhead vs. repair savings), `success_rate_lift`, `duration_overhead_s`
+
+Instrumentation: `envcheck/agent/nodes.py` exposes `reset_metrics()` / `get_metrics()` that count LLM calls, tokens (from `usage_metadata`), web_search invocations, preflight runs. `run_eval.py` resets before each run and snapshots after.
+
+The eval flow does **not** modify `candidates.json` and uses the same cached `envs/` as `verify_ground_truth.py`, so re-runs are fast.
+
 ## Distribution
 
 24 cases (all `verified=true`):
