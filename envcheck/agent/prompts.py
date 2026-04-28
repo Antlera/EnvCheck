@@ -129,10 +129,25 @@ to be escaped. Format exactly:
 """
 
 GENERATION_PROMPT = """\
-Generate the final code for the task. The code MUST be context-aware, using \
-the EXACT versions and API signatures confirmed by the environment probes \
-and preflight tests below. If the preflight test failed, READ THE STDERR — \
-that is the actual breaking-change error you must avoid in your final code.
+Generate the final code for the task. You MUST use exactly the following \
+APIs that the planning step selected and the preflight step verified to \
+exist in this environment:
+
+VERIFIED APIs TO USE (use these exact dotted paths, do not substitute):
+{proposed_apis}
+
+Rules for using the proposed APIs:
+1. Import ONLY top-level packages (e.g. `import matplotlib`, `import sklearn`, \
+`from PIL import Image`). Never write `import package.submodule.attr as alias` \
+for accessing a non-module attribute — many proposed paths point to \
+attributes / classes / functions inside a submodule, NOT to importable \
+modules themselves. When unsure, do `import LIB` and write the full dotted \
+path at use site.
+2. Use the proposed dotted path verbatim at the call site (e.g. write \
+`matplotlib.colormaps.register(cmap, name=...)` rather than aliasing it).
+3. Do not invent additional alternatives, do not "improve" by switching to \
+related APIs, and do not modify code unrelated to these APIs. Use a \
+minimal, conservative implementation.
 
 Environment:
 {env_info}
@@ -140,7 +155,7 @@ Environment:
 KB Rules (relevant breaking changes):
 {kb_results}
 
-Preflight test result:
+Preflight test result (PASS/FAIL per API):
 {preflight_result}
 
 Task: {task_description}

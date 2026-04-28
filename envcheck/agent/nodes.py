@@ -467,14 +467,39 @@ def plan_node(state: EnvPilotState) -> dict[str, Any]:
         }
 
 
+# PyPI distribution name → Python import name (for cases where they differ).
+# Used so preflight's `importlib.import_module("scikit-learn")` doesn't fail
+# with a spurious ModuleNotFoundError when the analysis identifies packages
+# by their pip name.
+_PIP_TO_IMPORT_NAME = {
+    "scikit-learn": "sklearn",
+    "scikit-image": "skimage",
+    "pillow": "PIL",
+    "beautifulsoup4": "bs4",
+    "pyyaml": "yaml",
+    "opencv-python": "cv2",
+    "python-dateutil": "dateutil",
+    "msgpack-python": "msgpack",
+    "google-auth": "google.auth",
+    "google-cloud-storage": "google.cloud.storage",
+}
+
+
+def _to_import_name(pkg: str) -> str:
+    """Map pip distribution name to Python import name (lower-case key lookup)."""
+    return _PIP_TO_IMPORT_NAME.get(pkg.lower(), pkg)
+
+
 def _build_deterministic_preflight(critical_apis: list[str],
                                     identified_packages: list[str]) -> str:
     """Build a deterministic preflight smoke test from analysis output.
 
-    For each `identified_package`, try `importlib.import_module`. For each
-    dotted `critical_api` (e.g. 'seaborn.histplot', 'pandas.DataFrame.append'),
-    walk the dotted path with getattr — AttributeError or ImportError is
-    recorded. Subprocess exit code = number of failures.
+    For each `identified_package`, try `importlib.import_module` (with
+    pip-name→import-name normalization, e.g. scikit-learn → sklearn).
+    For each dotted `critical_api` (e.g. 'seaborn.histplot',
+    'pandas.DataFrame.append'), walk the dotted path with getattr —
+    AttributeError or ImportError is recorded. Subprocess exit code =
+    number of failures.
 
     No LLM call. Always produces valid Python. The stdout cleanly enumerates
     which APIs are missing, so the generation node can read it and avoid
@@ -492,25 +517,45 @@ def _build_deterministic_preflight(critical_apis: list[str],
     for pkg in identified_packages:
         if not pkg or not isinstance(pkg, str):
             continue
+        import_name = _to_import_name(pkg)
         lines += [
             f"try:",
-            f"    importlib.import_module({pkg!r})",
+            f"    importlib.import_module({import_name!r})",
             f"    _passed.append('import {pkg}')",
             f"except Exception as _e:",
             f"    _failures.append('import ' + {pkg!r} + ': ' + repr(_e))",
             "",
         ]
 
+    # Helper: walk a dotted path "a.b.C.method" by finding the longest
+    # importable prefix (handles submodules like sklearn.preprocessing,
+    # matplotlib.pyplot, PIL.Image — which Python doesn't auto-load when
+    # you `import sklearn` / `import matplotlib` / `import PIL`).
+    lines += [
+        "def _walk(api):",
+        "    parts = api.split('.')",
+        "    last_err = None",
+        "    for i in range(len(parts), 0, -1):",
+        "        try:",
+        "            obj = importlib.import_module('.'.join(parts[:i]))",
+        "            for attr in parts[i:]:",
+        "                obj = getattr(obj, attr)",
+        "            return obj",
+        "        except (ImportError, ModuleNotFoundError) as _ie:",
+        "            last_err = _ie",
+        "            continue",
+        "        except AttributeError as _ae:",
+        "            last_err = _ae",
+        "            break",
+        "    raise last_err if last_err else ImportError(api)",
+        "",
+    ]
+
     for api in critical_apis:
         if not api or not isinstance(api, str) or "." not in api:
             continue
-        mod, _, attrs = api.partition(".")
-        attr_path = attrs.split(".")
-        lines.append(f"# {api}")
-        lines.append("try:")
-        lines.append(f"    _o = importlib.import_module({mod!r})")
-        for attr in attr_path:
-            lines.append(f"    _o = getattr(_o, {attr!r})")
+        lines.append(f"try:")
+        lines.append(f"    _walk({api!r})")
         lines.append(f"    _passed.append({api!r})")
         lines.append("except Exception as _e:")
         lines.append(f"    _failures.append({api!r} + ': ' + repr(_e))")
@@ -587,6 +632,7 @@ def generation_node(state: EnvPilotState) -> dict[str, Any]:
     logger.info("[Phase 5] Generating final code...")
 
     prompt = GENERATION_PROMPT.format(
+        proposed_apis=json.dumps(state.get("proposed_apis") or [], indent=2),
         env_info=json.dumps(state.get("env_info", {}), indent=2),
         kb_results=json.dumps(state.get("kb_results", []), indent=2),
         preflight_result=json.dumps(state.get("preflight_result", {}), indent=2),
