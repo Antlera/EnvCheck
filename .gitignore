@@ -5,6 +5,11 @@ benchmark/verification_report.json
 benchmark/eval_results.json
 benchmark/eval_summary.json
 
+# Local secrets — never commit
+.env
+.env.local
+.env.*.local
+
 # Generated test scripts (created at runtime)
 test_cases/generated/
 
