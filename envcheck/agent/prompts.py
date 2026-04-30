@@ -129,25 +129,21 @@ to be escaped. Format exactly:
 """
 
 GENERATION_PROMPT = """\
-Generate the final code for the task. You MUST use exactly the following \
-APIs that the planning step selected and the preflight step verified to \
-exist in this environment:
+Generate the final code for the task.
 
-VERIFIED APIs TO USE (use these exact dotted paths, do not substitute):
+The planning + preflight steps have determined which APIs are safe to use \
+in this environment. Use the corresponding API SYMBOLS (functions / classes / \
+methods) — they have been verified to exist. Idiomatic aliasing is fine \
+(e.g. `import numpy as np` → `np.array(...)`); do NOT write `import \
+package.submodule.attr as alias` for non-module attributes (e.g. \
+`matplotlib.colormaps` is a singleton, not a module — write \
+`import matplotlib as mpl; mpl.colormaps.register(...)`).
+
+Verified safe APIs (treat as a guide, not a literal substitution string):
 {proposed_apis}
 
-Rules for using the proposed APIs:
-1. Import ONLY top-level packages (e.g. `import matplotlib`, `import sklearn`, \
-`from PIL import Image`). Never write `import package.submodule.attr as alias` \
-for accessing a non-module attribute — many proposed paths point to \
-attributes / classes / functions inside a submodule, NOT to importable \
-modules themselves. When unsure, do `import LIB` and write the full dotted \
-path at use site.
-2. Use the proposed dotted path verbatim at the call site (e.g. write \
-`matplotlib.colormaps.register(cmap, name=...)` rather than aliasing it).
-3. Do not invent additional alternatives, do not "improve" by switching to \
-related APIs, and do not modify code unrelated to these APIs. Use a \
-minimal, conservative implementation.
+Avoid switching to a different alternative API than what was proposed \
+above, and avoid modifying code paths unrelated to these APIs.
 
 Environment:
 {env_info}
